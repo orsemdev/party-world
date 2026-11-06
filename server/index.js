@@ -3,14 +3,52 @@ import express from "express";
 import { createServer } from "node:http";
 import { Server } from "socket.io";
 import OpenAI from "openai";
+import fs from "node:fs";
+import path from "node:path";
+import { fileURLToPath } from "node:url";
 
 const app = express();
+// Render sits behind a trusted reverse proxy. This lets Express use the real
+// visitor IP from the proxy rather than the proxy's own address.
+app.set("trust proxy", 1);
 app.use(express.json({ limit: "20kb" }));
 app.use(express.static("dist"));
 const httpServer = createServer(app);
 const io = new Server(httpServer, { cors: { origin: "*" } });
 const PORT = Number(process.env.PORT || 2567);
 const players = new Map();
+const serverDir = path.dirname(fileURLToPath(import.meta.url));
+const banFile = process.env.IP_BAN_FILE || path.join(serverDir, "data", "ip-bans.json");
+const bannedIps = new Set();
+
+try {
+  const savedBans = JSON.parse(fs.readFileSync(banFile, "utf8"));
+  if (Array.isArray(savedBans)) savedBans.forEach(ip => bannedIps.add(String(ip)));
+} catch { /* First run: no ban file yet. */ }
+
+function getClientIp(socket) {
+  // Render supplies X-Forwarded-For from its edge proxy. Fall back to the
+  // direct socket address for local development.
+  const forwarded = socket.handshake.headers["x-forwarded-for"];
+  const ip = typeof forwarded === "string" ? forwarded.split(",")[0].trim() : socket.handshake.address;
+  return String(ip || "unknown").replace(/^::ffff:/, "");
+}
+
+function containsBannedSlur(message) {
+  // Detect common spellings and simple punctuation/leet obfuscations without
+  // storing or repeating the offensive term in chat.
+  return /(?:^|[^a-z0-9])n[\W_]*[i1!][\W_]*[gq9][\W_]*[gq9][\W_]*(?:er|a|ah|uh)(?=$|[^a-z0-9])/i.test(message);
+}
+
+function persistBans() {
+  try {
+    fs.mkdirSync(path.dirname(banFile), { recursive: true });
+    fs.writeFileSync(banFile, JSON.stringify([...bannedIps], null, 2));
+  } catch (error) {
+    console.error("Could not save IP bans:", error.message);
+  }
+}
+
 const openai = process.env.OPENAI_API_KEY
   ? new OpenAI({ apiKey: process.env.OPENAI_API_KEY })
   : null;
@@ -53,6 +91,13 @@ app.post("/api/ai", async (req, res) => {
 });
 
 io.on("connection", socket => {
+  const clientIp = getClientIp(socket);
+  if (bannedIps.has(clientIp)) {
+    socket.emit("chat:error", "You are banned from this server for abusive language.");
+    socket.disconnect(true);
+    return;
+  }
+
   socket.on("join", rawName => {
     const name = String(rawName || "Guest").trim().slice(0, 18) || "Guest";
     const player = {
@@ -81,7 +126,18 @@ io.on("connection", socket => {
   socket.on("chat:send", raw => {
     const p = players.get(socket.id);
     const text = String(raw || "").trim().slice(0, 240);
-    if (p && text) io.emit("chat:message", { name: p.name, text, system: false });
+    if (!p || !text) return;
+
+    if (containsBannedSlur(text)) {
+      bannedIps.add(clientIp);
+      persistBans();
+      socket.emit("chat:error", "You have been banned from this server for racist language.");
+      io.emit("chat:message", { name: "WORLD", text: `${p.name} was removed for abusive language.`, system: true });
+      socket.disconnect(true);
+      return;
+    }
+
+    io.emit("chat:message", { name: p.name, text, system: false });
   });
 
   socket.on("disconnect", () => {

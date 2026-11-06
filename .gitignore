@@ -1,3 +1,6 @@
 node_modules
 dist
 .env
+
+# Local moderation data (do not commit visitor IP addresses)
+server/data/ip-bans.json
