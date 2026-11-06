@@ -194,6 +194,7 @@ function connect(name) {
   });
   socket.on("player:left", id => { removePlayer(id); document.querySelector("#online-count").textContent = meshes.size; });
   socket.on("chat:message", addMessage);
+  socket.on("chat:error", message => addMessage({ name: "MODERATION", text: message, system: true }));
   animate();
 }
 document.querySelector("#join-form").addEventListener("submit", e => {
